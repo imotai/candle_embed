@@ -1,3 +1,6 @@
+#[cfg(feature = "mkl")]
+extern crate intel_mkl_src;
+
 pub mod models;
 use anyhow::{Error, Result};
 use candle::{Device, IndexOp, Tensor};
@@ -33,6 +36,7 @@ impl Default for CandleEmbedBuilder {
         Self::new()
     }
 }
+
 impl CandleEmbedBuilder {
     /// Creates a new instance of `CandleEmbedBuilder` with default configuration
     pub fn new() -> Self {
