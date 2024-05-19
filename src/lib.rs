@@ -8,10 +8,7 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, HiddenAct, DTYPE};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 pub use models::WithModel;
-use std::{
-    cell::RefCell,
-    panic::{self, AssertUnwindSafe},
-};
+use std::panic::{self, AssertUnwindSafe};
 use tokenizers::{Encoding, Tokenizer};
 
 pub enum WithDevice {
@@ -123,11 +120,49 @@ impl CandleEmbedBuilder {
         self.with_device = WithDevice::SpecificCudaDevice(ordinal);
         self
     }
+
+    fn init_device(&self) -> Result<Device> {
+        if let WithDevice::Cpu = self.with_device {
+            return Ok(Device::Cpu);
+        } else {
+            if !candle::utils::cuda_is_available() {
+                eprintln!("CUDA is not available, falling back to CPU");
+                return Ok(Device::Cpu);
+            };
+            if let WithDevice::SpecificCudaDevice(i) = self.with_device {
+                if let Ok(cuda_device) = Device::cuda_if_available(i) {
+                    return Ok(cuda_device);
+                } else {
+                    eprintln!("CUDA device {i} is not available, trying other cuda devices");
+                };
+            };
+            for i in 0..6 {
+                let result = panic::catch_unwind(AssertUnwindSafe(|| Device::cuda_if_available(i)));
+                match result {
+                    Ok(Ok(device)) => match device {
+                        Device::Cuda(_) => return Ok(device),
+                        _ => {
+                            eprintln!("CUDA is not available, checked device {i}.");
+                        }
+                    },
+                    Ok(Err(_)) => {
+                        eprintln!("Error occurred while checking CUDA device {i}, trying other CUDA devices");
+                    }
+                    Err(_) => {
+                        eprintln!("Unexpected error (panic) occurred while checking CUDA device {i}, trying other CUDA devices");
+                    }
+                }
+            }
+        };
+        eprintln!("No CUDA devices available, falling back to CPU");
+        Ok(Device::Cpu)
+    }
+
     /// Builds and returns a `BasedBertEmbedder` instance based on the configured settings.
     ///
     pub fn build(self) -> Result<BasedBertEmbedder> {
         let model_id = self.embedding_model.get_model_id_string();
-        let model_revision = self.model_revision;
+        let model_revision = self.model_revision.clone();
         let repo = Repo::with_revision(model_id, RepoType::Model, model_revision.clone());
         let (config_filename, tokenizer_filename, weights_filename) = {
             let api = Api::new()?.repo(repo);
@@ -154,20 +189,22 @@ impl CandleEmbedBuilder {
         if self.approximate_gelu {
             config.hidden_act = HiddenAct::GeluApproximate;
         }
+        let tokenizer = Tokenizer::from_file(tokenizer_filename.clone()).map_err(Error::msg)?;
+        let device = self.init_device()?;
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[weights_filename.clone()], DTYPE, &device)?
+        };
+        let model = BertModel::load(vb, &config)?;
         Ok(BasedBertEmbedder {
-            config,
             model_dimensions: hidden_size,
             model_id: self.embedding_model,
             model_max_input: max_position_embeddings,
             model_rev: model_revision,
             mean_pooling: self.mean_pooling,
-            model: RefCell::new(None),
+            model,
             normalize_embeddings: self.noramlize_embeddings,
-            tokenizer_filename,
-            tokenizer: RefCell::new(None),
+            tokenizer,
             truncate_text_len_overflow: self.truncate_text_len_overflow,
-            weights_filename,
-            with_device: self.with_device,
         })
     }
 }
@@ -177,89 +214,18 @@ impl CandleEmbedBuilder {
 /// and unload the model from memory.
 /// It is initialized with the [CandleEmbedBuilder] struct.
 pub struct BasedBertEmbedder {
-    config: Config,
     mean_pooling: bool,
-    model: RefCell<Option<BertModel>>,
+    model: BertModel,
     normalize_embeddings: bool,
     pub model_dimensions: usize,
     pub model_id: WithModel,
     pub model_max_input: usize,
     pub model_rev: String,
-    tokenizer_filename: std::path::PathBuf,
-    tokenizer: RefCell<Option<Tokenizer>>,
+    tokenizer: Tokenizer,
     truncate_text_len_overflow: bool,
-    weights_filename: std::path::PathBuf,
-    with_device: WithDevice,
 }
 
 impl BasedBertEmbedder {
-    /// Loads the tokenizer.
-    ///
-    pub fn load_tokenizer(&self) -> Result<()> {
-        *self.tokenizer.borrow_mut() =
-            Some(Tokenizer::from_file(self.tokenizer_filename.clone()).map_err(Error::msg)?);
-
-        Ok(())
-    }
-
-    /// Loads the BERT model.
-    ///
-    pub fn load_model(&self) -> Result<()> {
-        let device = self.init_device()?;
-        let weights_filename = self.weights_filename.clone(); // Clone the weights_filename
-        let vb =
-            unsafe { VarBuilder::from_mmaped_safetensors(&[weights_filename], DTYPE, &device)? };
-        *self.model.borrow_mut() = Some(BertModel::load(vb, &self.config)?);
-        Ok(())
-    }
-
-    /// Unloads the BERT model and tokenizer, freeing up memory. Call this when you are done using the model.
-    ///
-    pub fn unload(&self) {
-        *self.model.borrow_mut() = None;
-        *self.tokenizer.borrow_mut() = None;
-    }
-
-    /// Initializes the device for model loading.
-    ///
-    fn init_device(&self) -> Result<Device> {
-        if let WithDevice::Cpu = self.with_device {
-            return Ok(Device::Cpu);
-        } else {
-            if !candle::utils::cuda_is_available() {
-                eprintln!("CUDA is not available, falling back to CPU");
-                return Ok(Device::Cpu);
-            };
-            if let WithDevice::SpecificCudaDevice(i) = self.with_device {
-                if let Ok(cuda_device) = Device::cuda_if_available(i) {
-                    return Ok(cuda_device);
-                } else {
-                    eprintln!("CUDA device {i} is not available, trying other cuda devices");
-                };
-            };
-            for i in 0..6 {
-                let result = panic::catch_unwind(AssertUnwindSafe(|| Device::cuda_if_available(i)));
-
-                match result {
-                    Ok(Ok(device)) => match device {
-                        Device::Cuda(_) => return Ok(device),
-                        _ => {
-                            eprintln!("CUDA is not available, checked device {i}.");
-                        }
-                    },
-                    Ok(Err(_)) => {
-                        eprintln!("Error occurred while checking CUDA device {i}, trying other CUDA devices");
-                    }
-                    Err(_) => {
-                        eprintln!("Unexpected error (panic) occurred while checking CUDA device {i}, trying other CUDA devices");
-                    }
-                }
-            }
-        };
-        eprintln!("No CUDA devices available, falling back to CPU");
-        Ok(Device::Cpu)
-    }
-
     /// Embeds a batch of texts using the loaded BERT model.
     ///
     pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -294,26 +260,13 @@ impl BasedBertEmbedder {
                 )));
             }
         }
-
-        if self.model.borrow().is_none() {
-            self.load_model()?;
-        }
-
-        let model = self.model.borrow();
-        let model = if let Some(model) = model.as_ref() {
-            model
-        } else {
-            panic!("Model did not load")
-        };
-
-        let device = &model.device;
+        let device = self.model.device.clone();
         let encoding = self.encode_text(text, true)?;
         let tokens = encoding.get_ids().to_vec();
-        let token_ids = Tensor::new(&tokens[..], device)?.unsqueeze(0)?;
+        let token_ids = Tensor::new(&tokens[..], &device)?.unsqueeze(0)?;
         let token_type_ids = token_ids.zeros_like()?;
 
-        let outputs = model.forward(&token_ids, &token_type_ids)?;
-
+        let outputs = self.model.forward(&token_ids, &token_type_ids)?;
         let embedding = if self.mean_pooling {
             // Mean pooling
             let (_n_sentence, n_tokens, _hidden_size) = outputs.dims3()?;
@@ -375,6 +328,7 @@ impl BasedBertEmbedder {
             .collect::<Vec<_>>();
         Ok(token_strings)
     }
+
     /// Encodes a batch of texts using the loaded tokenizer. Used for the tokenizer functions and for pre-checking the input size. It is not used to generate embeddings.
     ///
     fn encode_text(&self, text: &str, with_trunc_settings: bool) -> Result<Encoding> {
@@ -383,15 +337,7 @@ impl BasedBertEmbedder {
                 "CandleEmbed error: encode_text called with an empty input text",
             ));
         }
-        if self.tokenizer.borrow().is_none() {
-            self.load_tokenizer()?;
-        }
-        let mut tokenizer = self.tokenizer.borrow_mut();
-        let tokenizer = if let Some(tokenizer) = tokenizer.as_mut() {
-            tokenizer
-        } else {
-            panic!("Tokenizer did not load")
-        };
+        let mut tokenizer = self.tokenizer.clone();
         let tokenizer = if with_trunc_settings && self.truncate_text_len_overflow {
             tokenizer
                 .with_padding(None)
@@ -400,13 +346,11 @@ impl BasedBertEmbedder {
                     ..Default::default()
                 }))
                 .map_err(anyhow::Error::msg)?
-                .clone()
         } else {
             tokenizer
                 .with_padding(None)
                 .with_truncation(None)
                 .map_err(anyhow::Error::msg)?
-                .clone()
         };
         let encoding: tokenizers::Encoding = tokenizer.encode(text, true).map_err(Error::msg)?;
         Ok(encoding)
@@ -419,15 +363,7 @@ impl BasedBertEmbedder {
                 "CandleEmbed error: encode_texts called with an empty input text",
             ));
         }
-        if self.tokenizer.borrow().is_none() {
-            self.load_tokenizer()?;
-        }
-        let mut tokenizer = self.tokenizer.borrow_mut();
-        let tokenizer = if let Some(tokenizer) = tokenizer.as_mut() {
-            tokenizer
-        } else {
-            panic!("Tokenizer did not load")
-        };
+        let mut tokenizer = self.tokenizer.clone();
         let tokenizer = if with_trunc_settings && self.truncate_text_len_overflow {
             tokenizer
                 .with_padding(None)
@@ -436,13 +372,11 @@ impl BasedBertEmbedder {
                     ..Default::default()
                 }))
                 .map_err(anyhow::Error::msg)?
-                .clone()
         } else {
             tokenizer
                 .with_padding(None)
                 .with_truncation(None)
                 .map_err(anyhow::Error::msg)?
-                .clone()
         };
         let encodings: Vec<tokenizers::Encoding> = tokenizer
             .encode_batch(texts.to_vec(), true)
@@ -467,7 +401,6 @@ mod tests {
             candle_embed.with_device,
             WithDevice::AnyCudaDevice
         ));
-        candle_embed.unload();
         Ok(())
     }
 
@@ -483,7 +416,6 @@ mod tests {
         assert_eq!(candle_embed.model_dimensions, 384);
         assert!(!candle_embed.normalize_embeddings);
         assert!(matches!(candle_embed.with_device, WithDevice::Cpu));
-        candle_embed.unload();
         Ok(())
     }
 
@@ -493,7 +425,6 @@ mod tests {
         let text = "This is a test sentence ok dog?";
         let embeddings = candle_embed.embed_one(text)?;
         assert_eq!(embeddings.len(), candle_embed.model_dimensions);
-        candle_embed.unload();
         Ok(())
     }
 
@@ -508,7 +439,6 @@ mod tests {
         let batch_embeddings = candle_embed.embed_batch(&texts)?;
         assert_eq!(batch_embeddings.len(), 3);
         assert_eq!(batch_embeddings[0].len(), candle_embed.model_dimensions);
-        candle_embed.unload();
         Ok(())
     }
 
@@ -553,8 +483,6 @@ mod tests {
             }
             Ok(_) => panic!("Expected error"),
         }
-
-        candle_embed.unload();
         Ok(())
     }
 
@@ -573,7 +501,6 @@ mod tests {
         let text = "This is the first sentence.";
         let tokens = candle_embed.tokenize_one(text)?;
         assert!(!tokens.is_empty());
-        candle_embed.unload();
         Ok(())
     }
 
@@ -592,7 +519,6 @@ mod tests {
         let text = "This is the first sentence.";
         let tokens = candle_embed.token_count(text)?;
         assert!(tokens > 0);
-        candle_embed.unload();
         Ok(())
     }
 }

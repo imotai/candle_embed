@@ -23,4 +23,4 @@ intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"] , optio
 [features]
 cuda=["candle/cuda", "candle/cudnn", "candle_nn/cuda"]
 mkl = ["dep:intel-mkl-src","candle/mkl", "candle_nn/mkl", "candle-transformers/mkl"]
-default= ["cuda"]
+default= ["mkl"]
